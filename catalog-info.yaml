@@ -3,7 +3,9 @@ kind: Component
 metadata:
   name: blitzy-celery
   description: Distributed Task Queue (development branch)
-  tags: []
+  tags:
+  - distributed-systems
+  - python
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-celery
     backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-celery/tree/main/
