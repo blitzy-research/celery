@@ -35,6 +35,7 @@ from celery.utils import abstract
 from celery.utils.collections import AttributeDictMixin
 from celery.utils.dispatch import Signal
 from celery.utils.functional import first, head_from_fun, maybe_list
+from celery.utils.green import cooperative_yield
 from celery.utils.imports import gen_task_name, instantiate, symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.objects import FallbackContext, mro_lookup
@@ -1132,6 +1133,10 @@ class Celery:
         """Helper for :meth:`connection_or_acquire`."""
         if pool:
             timeout = self.conf.broker_pool_acquire_timeout
+            # Acquiring a pooled connection performs no blocking operation
+            # while the pool is warm, so under gevent this greenlet would
+            # never reach the hub and would starve its peers (#10044).
+            cooperative_yield()
             try:
                 return self.pool.acquire(block=True, timeout=timeout)
             except LimitExceeded as exc:
@@ -1161,6 +1166,12 @@ class Celery:
 
     def _acquire_producer(self, timeout=None):
         """Helper for :meth:`producer_or_acquire`."""
+        # Every step of a pooled publish is non-blocking once the pool is
+        # warm: the LIFO returns an idle slot immediately, the declaration
+        # is cached, and the frame is written with a fire-and-forget
+        # sendall.  Nothing switches to the gevent hub, so a greenlet
+        # publishing in a loop starves every other greenlet (#10044).
+        cooperative_yield()
         try:
             return self.producer_pool.acquire(block=True, timeout=timeout)
         except LimitExceeded as exc:
