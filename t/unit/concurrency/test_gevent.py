@@ -167,7 +167,7 @@ class test_cooperative_publishing:
     WINDOW = 10
     # Hang guard only.  The baton is handed on in microseconds while the ring
     # is intact, so this never fires; it exists so that a stalled ring fails
-    # the metric assertion instead of blocking the suite.  Nothing about the
+    # loudly and immediately instead of blocking the suite.  Nothing about the
     # measured property depends on wall-clock time.
     RESCUE_TIMEOUT = 5.0
 
@@ -228,8 +228,28 @@ class test_cooperative_publishing:
             return int(threading.current_thread().name.rsplit('-', 1)[1])
 
         def park(index):
-            batons[index].wait(timeout=self.RESCUE_TIMEOUT)
+            # Fail closed.  ``Event.wait`` returns False when it timed out,
+            # which means the baton never arrived and this publisher does not
+            # own the ring; resuming anyway would let two publishers emit at
+            # once and can fabricate the healthy signature the code under test
+            # never produced -- a stranded publisher measures 5.00 with no solo
+            # block, so the oracle assertions cannot be relied on to catch it.
+            # The stall is therefore turned into an error that ``publish``
+            # records and ``_drive`` re-raises once every thread has been
+            # joined, and the baton is cleared only once it has been owned.
+            if not batons[index].wait(timeout=self.RESCUE_TIMEOUT):
+                raise TimeoutError(
+                    f'token ring stalled: publisher {index} waited '
+                    f'{self.RESCUE_TIMEOUT}s for a baton that never arrived'
+                )
             batons[index].clear()
+            if aborting.is_set():
+                # Released by the rescue path below rather than by a peer
+                # handing the baton on, so ownership is just as broken.
+                raise RuntimeError(
+                    f'token ring aborted: publisher {index} was released '
+                    'without receiving the baton'
+                )
 
         def hand_off(index):
             successor = next_active(index)
@@ -280,7 +300,9 @@ class test_cooperative_publishing:
         finally:
             # Rescue path.  Inert while the ring is intact, but it guarantees
             # no publisher can outlive the test even if one stalls, because
-            # ``threads_not_lingering`` fails the test case otherwise.
+            # ``threads_not_lingering`` fails the test case otherwise.  A
+            # publisher woken from a park by this path reports the broken
+            # ownership instead of resuming, so a stall can never pass.
             aborting.set()
             for baton in batons:
                 baton.set()
