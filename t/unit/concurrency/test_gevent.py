@@ -154,21 +154,13 @@ class test_apply_timeout:
 
 
 class test_cooperative_publishing:
-    # Regression guard for celery/celery#10044.  Once the producer pool is
-    # warm every step of a publish is non-blocking -- the LIFO hands back an
-    # idle slot immediately, the declaration comes from the per-connection
-    # cache, and the frame is written with a fire-and-forget sendall -- so
-    # nothing switched to the gevent hub and a greenlet publishing in a loop
-    # starved every peer.  These constants mirror the acceptance oracle: five
-    # publishers, ten publishes each, and the mean number of distinct
-    # publishers per ten-wide sliding window as the metric.
+    # Match the acceptance oracle: five publishers, ten publishes each, and
+    # ten-item sliding windows.
     PUBLISHERS = 5
     ITERATIONS = 10
     WINDOW = 10
-    # Hang guard only.  The baton is handed on in microseconds while the ring
-    # is intact, so this never fires; it exists so that a stalled ring fails
-    # loudly and immediately instead of blocking the suite.  Nothing about the
-    # measured property depends on wall-clock time.
+    # Bounds baton waits and joins so a stalled ring fails instead of hanging.
+    # The oracle depends on emission order, not elapsed time.
     RESCUE_TIMEOUT = 5.0
 
     def setup_method(self):
@@ -207,10 +199,9 @@ class test_cooperative_publishing:
         return MagicMock(name='producer_pool')
 
     def _drive(self, sleep):
-        # Deterministic token ring standing in for the gevent scheduler:
-        # exactly one publisher is runnable at any instant, and the baton only
-        # moves when the code under test reaches the patched ``gevent.sleep``
-        # or when a publisher retires.  No broker, no real hub, no timing.
+        # Deterministic token ring: only the baton owner may emit.  Ownership
+        # moves at the patched ``gevent.sleep`` or when a publisher retires;
+        # oracle assertions use emission order, not elapsed time.
         emitted = []
         errors = []
         batons = [threading.Event() for _ in range(self.PUBLISHERS)]
@@ -228,15 +219,10 @@ class test_cooperative_publishing:
             return int(threading.current_thread().name.rsplit('-', 1)[1])
 
         def park(index):
-            # Fail closed.  ``Event.wait`` returns False when it timed out,
-            # which means the baton never arrived and this publisher does not
-            # own the ring; resuming anyway would let two publishers emit at
-            # once and can fabricate the healthy signature the code under test
-            # never produced -- a stranded publisher measures 5.00 with no solo
-            # block, so the oracle assertions cannot be relied on to catch it.
-            # The stall is therefore turned into an error that ``publish``
-            # records and ``_drive`` re-raises once every thread has been
-            # joined, and the baton is cleared only once it has been owned.
+            # A timed-out wait means this publisher never acquired the baton.
+            # Resuming could create concurrent emitters and a false healthy
+            # ordering, so fail and clear the event only after ownership is
+            # established.
             if not batons[index].wait(timeout=self.RESCUE_TIMEOUT):
                 raise TimeoutError(
                     f'token ring stalled: publisher {index} waited '
@@ -244,8 +230,8 @@ class test_cooperative_publishing:
                 )
             batons[index].clear()
             if aborting.is_set():
-                # Released by the rescue path below rather than by a peer
-                # handing the baton on, so ownership is just as broken.
+                # Once rescue starts, a wake-up no longer proves a peer
+                # hand-off, so ownership cannot be trusted.
                 raise RuntimeError(
                     f'token ring aborted: publisher {index} was released '
                     'without receiving the baton'
@@ -298,11 +284,9 @@ class test_cooperative_publishing:
             for thread in threads:
                 thread.join(timeout=self.RESCUE_TIMEOUT)
         finally:
-            # Rescue path.  Inert while the ring is intact, but it guarantees
-            # no publisher can outlive the test even if one stalls, because
-            # ``threads_not_lingering`` fails the test case otherwise.  A
-            # publisher woken from a park by this path reports the broken
-            # ownership instead of resuming, so a stall can never pass.
+            # Wake parked publishers and retry all joins during cleanup.  Any
+            # survivor fails the liveness checks, and rescue wake-ups fail
+            # ownership validation instead of resuming.
             aborting.set()
             for baton in batons:
                 baton.set()
@@ -353,10 +337,8 @@ class test_cooperative_publishing:
         assert connection is pool.acquire.return_value
 
     def test_does_not_yield_when_no_pool_is_used(self):
-        # The gevent environment is armed by ``setup_method`` exactly as it is
-        # for the two tests above, so this cannot pass vacuously: it fails if
-        # the yield is ever hoisted out of the ``if pool:`` branch, which is
-        # what keeps the non-pooled callers unaffected.
+        # ``setup_method`` arms gevent, so ``assert_not_called`` fails if the
+        # yield moves outside the pool-only branch.
         sleep = self.patching('gevent.sleep')
         with patch.object(self.app, 'connection_for_write') as connection_for_write:
             connection = self.app._acquire_connection(pool=False)
@@ -373,8 +355,7 @@ class test_cooperative_publishing:
         ):
             emitted = self._drive(sleep)
         assert len(emitted) == self.PUBLISHERS * self.ITERATIONS
-        # A perfect round robin scores exactly PUBLISHERS on the oracle's
-        # metric, which is the healthy signature the fix restores.
+        # Every ten-item window in a perfect round robin contains all publishers.
         assert self._effective_concurrency(emitted) == float(self.PUBLISHERS)
         assert not self._has_solo_block(emitted)
         assert pool.acquire.call_count == self.PUBLISHERS * self.ITERATIONS
@@ -383,9 +364,9 @@ class test_cooperative_publishing:
     def test_publishers_run_sequentially_without_the_yield(self):
         sleep = self.patching('gevent.sleep')
         pool = self._publisher_pool()
-        # Negative control.  Disabling the yield must reinstate the reported
-        # failure through the identical harness, which is what makes the test
-        # above a regression guard rather than a tautology.
+        # Paired negative control: without the yield, the same harness must
+        # serialize publishers, proving the positive case measures
+        # cooperative scheduling.
         with patch('celery.app.base.cooperative_yield', return_value=False):
             with patch.object(
                 type(self.app), 'producer_pool',

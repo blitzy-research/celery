@@ -28,7 +28,6 @@ class test_cooperative_yield:
         return sleep
 
     def test_is_a_noop_when_gevent_was_never_imported(self, monkeypatch):
-        # With gevent absent, the guard returns before either function-local import.
         monkeypatch.delitem(sys.modules, 'gevent', raising=False)
         assert cooperative_yield() is False
         assert green._yield is None
